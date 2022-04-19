@@ -11,8 +11,13 @@ clang/llvm 13+ from source https://github.com/llvm/llvm-project
 Xilinx cmakeModules from https://github.com/Xilinx/cmakeModules
 ```
 
+In addition, the following optional packages may be useful
+```
+LibXAIE is a backend target used to execute designs in hardware: https://github.com/Xilinx/embeddedsw/tree/master/XilinxProcessorIPLib/drivers/aiengine
+```
+
 Currently, the only supported target is the Xilinx VCK190 board, running Ubuntu-based Linux, however
-the tools are largely board and device indepdendent and can be adapted to other environments.
+the tools are largely board and device independent and can be adapted to other environments.
 
 ## Building on X86
 
@@ -20,12 +25,12 @@ First compile LLVM, with the ability to target AArch64 as a cross-compiler, and 
 In addition, we make some common build optimizations to use a linker ('lld' or 'gold') other than
 'ld' (which tends to be quite slow on large link jobs) and to link against libLLVM.so and libClang
 so.  You may find that other options are also useful.  Note that due to changing MLIR APIs, only a
-particular revision is expected to work.
+particular revision is expected to work.  See utils/clone-llvm.sh for the correct commithash.
 
 ```sh
 git clone https://github.com/llvm/llvm-project
 cd llvm-project
-git checkout ebe408ad8003
+git checkout ${commithash}
 mkdir ${LLVMBUILD}; cd ${LLVMBUILD}
 cmake -GNinja \
     -DLLVM_LINK_LLVM_DYLIB=ON \
@@ -48,7 +53,8 @@ mkdir build; cd build
 cmake -GNinja \
     -DLLVM_DIR=${absolute path to LLVMBUILD}/lib/cmake/llvm \
     -DMLIR_DIR=${absolute path to LLVMBUILD}/lib/cmake/mlir \
-    -DCMAKE_MODULE_PATH=/absolute/path/to/cmakeModules/ \
+    -DLibXAIE_DIR=${absolute path to LibXAIE} \
+    -DCMAKE_MODULE_PATH=${absolute path to cmakeModules}/ \
     -DVitisSysroot=${SYSROOT} \
     -DCMAKE_BUILD_TYPE=Debug \
     ..
