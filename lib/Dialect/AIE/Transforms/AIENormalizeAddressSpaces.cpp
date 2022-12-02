@@ -32,7 +32,7 @@ Type memRefToDefaultAddressSpace(Type t) {
     return t;
 }
 
-#include "aie/Dialect/AIE/AIENormalizeAddressSpaces.inc"
+#include "aie/Dialect/AIE/Transforms/AIENormalizeAddressSpaces.inc"
 
 struct AIENormalizeAddressSpacesPass
     : public AIENormalizeAddressSpacesBase<AIENormalizeAddressSpacesPass> {

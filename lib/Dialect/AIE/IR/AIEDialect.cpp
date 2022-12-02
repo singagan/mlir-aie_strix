@@ -416,7 +416,7 @@ AIEDialect::AIEDialect(mlir::MLIRContext *ctx)
   addTypes<AIEObjectFifoType, AIEObjectFifoSubviewType>();
   addOperations<
 #define GET_OP_LIST
-#include "aie/Dialect/AIE/AIE.cpp.inc"
+#include "aie/Dialect/AIE/IR/AIE.cpp.inc"
       >();
   addInterfaces<AIEInlinerInterface, AIEDialectFoldInterface>();
 }
@@ -933,23 +933,14 @@ LogicalResult xilinx::AIE::UseLockOp::verify() {
   }
 }
 
-#include "aie/Dialect/AIE/AIEEnums.cpp.inc"
-#include "aie/Dialect/AIE/AIEInterfaces.cpp.inc"
+#include "aie/Dialect/AIE/IR/AIEEnums.cpp.inc"
+#include "aie/Dialect/AIE/IR/AIEInterfaces.cpp.inc"
 
 #define GET_OP_CLASSES
-#include "aie/Dialect/AIE/AIE.cpp.inc"
+#include "aie/Dialect/AIE/IR/AIE.cpp.inc"
 
 namespace xilinx {
 namespace AIE {
-
-// void CoreOp::build(Builder *odsBuilder, OperationState &odsState, Type
-// resultType0, int col, int row) {
-//   odsState.addOperands(colValue);
-//   odsState.addOperands(rowValue);
-//   odsState.addTypes(resultType0);
-// }
-
-//#include "ATenOpInterfaces.cpp.inc"
 
 int SwitchboxOp::getNumSourceConnections(WireBundle bundle) {
   if (getTileOp().isShimTile())

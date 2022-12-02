@@ -21,7 +21,7 @@ namespace aie {
 
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION
-#include "aie/Dialect/AIE/AIEPasses.h.inc"
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h.inc"
 
 } // namespace aie
 

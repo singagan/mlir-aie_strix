@@ -34,7 +34,7 @@
 
 using namespace mlir;
 
-#include "aie/Dialect/AIE/AIEEnums.h.inc"
+#include "aie/Dialect/AIE/IR/AIEEnums.h.inc"
 
 namespace mlir {
 namespace OpTrait {
@@ -50,7 +50,7 @@ typedef std::pair<int, int> TileID;
 } // namespace xilinx
 
 /// Include the generated interface declarations.
-#include "aie/Dialect/AIE/AIEInterfaces.h.inc"
+#include "aie/Dialect/AIE/IR/AIEInterfaces.h.inc"
 
 namespace xilinx {
 namespace AIE {
@@ -199,13 +199,13 @@ bool isLegalMemAffinity(int coreCol, int coreRow, int memCol, int memRow);
 
 // include TableGen generated Op definitions
 #define GET_OP_CLASSES
-#include "aie/Dialect/AIE/AIE.h.inc"
+#include "aie/Dialect/AIE/IR/AIE.h.inc"
 
 namespace xilinx {
 namespace AIE {
 
 #define GEN_PASS_CLASSES
-#include "aie/Dialect/AIE/AIEPasses.h.inc"
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h.inc"
 
 std::unique_ptr<OperationPass<ModuleOp>> createAIEAssignBufferAddressesPass();
 std::unique_ptr<OperationPass<ModuleOp>> createAIEAssignLockIDsPass();
@@ -231,7 +231,7 @@ createAIEObjectFifoRegisterProcessPass();
 
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION
-#include "aie/Dialect/AIE/AIEPasses.h.inc"
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h.inc"
 
 } // namespace AIE
 } // namespace xilinx
