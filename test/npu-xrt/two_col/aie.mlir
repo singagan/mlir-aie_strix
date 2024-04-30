@@ -1,5 +1,5 @@
 module {
-  aie.device(npu) {
+  aie.device(npu1_1col) {
     %0 = aie.tile(0, 0)
     %1 = aie.tile(0, 1)
     %2 = aie.tile(0, 2)

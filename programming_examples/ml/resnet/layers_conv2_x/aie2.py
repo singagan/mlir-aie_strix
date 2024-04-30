@@ -34,7 +34,7 @@ def resnet_conv_x():
 
     with mlir_mod_ctx() as ctx:
 
-        @device(AIEDevice.npu)
+        @device(AIEDevice.npu1_1col)
         def deviceBody():
 
             # define types
