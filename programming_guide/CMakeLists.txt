@@ -68,7 +68,7 @@ set(LLVM_RUNTIME_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/bin)
 set(LLVM_LIBRARY_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/lib)
 set(MLIR_BINARY_DIR ${CMAKE_BINARY_DIR})
 
-find_package(Vitis 2023.2 COMPONENTS AIE AIE2)
+find_package(Vitis 2024.2 COMPONENTS AIE AIE2 AIE2P)
 find_package(Python3 COMPONENTS Interpreter)
 find_package(XRT)
 find_package(OpenCV)

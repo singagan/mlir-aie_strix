@@ -48,5 +48,6 @@ endfunction()
 
 add_subdirectory(AIE)
 add_subdirectory(AIE2)
+add_subdirectory(AIE2P)
 
 

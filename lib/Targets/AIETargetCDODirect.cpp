@@ -435,7 +435,12 @@ struct AIEControl {
       devGen = XAIE_DEV_GEN_AIE;
       break;
     case AIEArch::AIE2:
-      devGen = XAIE_DEV_GEN_AIEML;
+      // FIXME: What if we don't have an IPU?  aie-rt
+      // models non-IPU devices differently.
+      devGen = XAIE_DEV_GEN_AIE2IPU;
+      break;
+    case AIEArch::AIE2p:
+      devGen = XAIE_DEV_GEN_AIE2P_STRIX_B0;
       break;
     }
     configPtr = XAie_Config{
@@ -453,7 +458,7 @@ struct AIEControl {
         /*AieTileNumRows*/
         static_cast<uint8_t>(tm.rows() - tm.getNumMemTileRows() - 1),
         /*PartProp*/ {},
-        /*Backend*/ XAIE_IO_BACKEND_CDO};
+        /*Backend */ XAIE_IO_BACKEND_CDO};
 
     // Quoting: The instance of a device must be always declared using this
     //		macro. In future, the same macro will be expanded to allocate
@@ -698,7 +703,8 @@ struct AIEControl {
     }
 
     // Cascade configuration
-    if (targetModel.getTargetArch() == AIEArch::AIE2) {
+    if ((targetModel.getTargetArch() == AIEArch::AIE2) ||
+        (targetModel.getTargetArch() == AIEArch::AIE2p)) {
       for (auto configOp : targetOp.getOps<ConfigureCascadeOp>()) {
         TileOp tile = cast<TileOp>(configOp.getTile().getDefiningOp());
         auto tileLoc = XAie_TileLoc(tile.getCol(), tile.getRow());
@@ -762,6 +768,7 @@ LogicalResult generateCDOBinariesSeparately(AIEControl &ctl,
                                             DeviceOp &targetOp, bool aieSim,
                                             bool enableCores) {
 
+  LLVM_DEBUG(llvm::dbgs() << "Generating aie_cdo_elfs.bin");
   if (failed(generateCDOBinary(
           (llvm::Twine(workDirPath) + std::string(1, ps) + "aie_cdo_elfs.bin")
               .str(),
@@ -770,12 +777,14 @@ LogicalResult generateCDOBinariesSeparately(AIEControl &ctl,
           })))
     return failure();
 
+  LLVM_DEBUG(llvm::dbgs() << "Generating aie_cdo_init.bin");
   if (failed(generateCDOBinary(
           (llvm::Twine(workDirPath) + std::string(1, ps) + "aie_cdo_init.bin")
               .str(),
           [&ctl, &targetOp] { return ctl.addInitConfigToCDO(targetOp); })))
     return failure();
 
+  LLVM_DEBUG(llvm::dbgs() << "Generating aie_cdo_enable.bin");
   if (enableCores &&
       failed(generateCDOBinary(
           (llvm::Twine(workDirPath) + std::string(1, ps) + "aie_cdo_enable.bin")
