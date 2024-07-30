@@ -1,4 +1,4 @@
-//===- AIEDialect.cpp -------------------------------------------*- C++ -*-===//
+//===- AIEXDialect.cpp ------------------------------------------*- C++ -*-===//
 //
 // This file is licensed under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -193,7 +193,9 @@ LogicalResult AIEX::NpuDmaMemcpyNdOp::verify() {
   if (strides[1] && sizes[0] > (1 << wrap_bits) - 1)
     return emitOpError("Size 0 exceeds the [0:" +
                        std::to_string((1 << wrap_bits) - 1) + "] range.");
-  if (strides[3] > (1 << step_bits))
+  // strides[3] exceeding the range is ok iff the sizes[3] is one, which is
+  // checked below
+  if (strides[3] > (1 << step_bits) && sizes[3] != 1)
     return emitOpError("Stride 3 exceeds the [1:" +
                        std::to_string(1 << step_bits) + "] range.");
   if (strides[2] > (1 << step_bits))
@@ -273,5 +275,85 @@ LogicalResult AIEX::NpuWriteBdOp::verify() {
     return emitOpError("Iteration Size exceeds the [0:63] range.");
   if (getIterationStride() > 0xFFFFF)
     return emitOpError("Iteration Stride exceeds the [0:1M-1] range.");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// RuntimeSequenceOp
+//===----------------------------------------------------------------------===//
+
+ParseResult AIEX::RuntimeSequenceOp::parse(OpAsmParser &parser,
+                                           OperationState &result) {
+
+  StringAttr nameAttr;
+  (void)parser.parseOptionalSymbolName(
+      nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes);
+
+  SmallVector<OpAsmParser::Argument> entryArgs;
+
+  // Entry arguments,  e.g. (%addr: memref<1xi32>)
+  ParseResult argParseResult = parser.parseCommaSeparatedList(
+      OpAsmParser::Delimiter::Paren, [&]() -> ParseResult {
+        OpAsmParser::Argument argument;
+        if (parser.parseArgument(argument, true, true)) {
+          return failure();
+        }
+        entryArgs.push_back(argument);
+        return success();
+      });
+  if (argParseResult) {
+    return argParseResult;
+  }
+
+  // Body
+  auto *body = result.addRegion();
+  ParseResult bodyParseResult = parser.parseRegion(*body, entryArgs, false);
+  if (bodyParseResult) {
+    return bodyParseResult;
+  }
+
+  return success();
+}
+
+void AIEX::RuntimeSequenceOp::print(OpAsmPrinter &printer) {
+  Region &body = getRegion();
+
+  auto nameAttr = (*this)->getAttrOfType<StringAttr>(
+      mlir::SymbolTable::getSymbolAttrName());
+  if (nameAttr) {
+    printer << ' ';
+    printer.printSymbolName(nameAttr);
+  }
+
+  printer << '(';
+  for (unsigned i = 0, n = body.getNumArguments(); i < n; i++) {
+    if (i > 0) {
+      printer << ", ";
+    }
+    printer.printRegionArgument(body.getArgument(i));
+  }
+  printer << ')';
+
+  printer << ' ';
+  printer.printRegion(body, false, true);
+}
+
+LogicalResult AIEX::RuntimeSequenceOp::verify() {
+  AIE::DeviceOp device = (*this)->getParentOfType<AIE::DeviceOp>();
+  if (!device) {
+    // this check is redudnant with the HasParent trait, but can't hurt
+    (*this)->emitOpError() << "must be inside AIE device operation.";
+    return failure();
+  }
+  auto seq_ops = device.getOps<AIEX::RuntimeSequenceOp>();
+  if (std::distance(seq_ops.begin(), seq_ops.end()) > 1) {
+    auto err = device.emitOpError()
+               << "Cannot have more than one runtime sequence per device.";
+    for (auto it = seq_ops.begin(); it != seq_ops.end(); ++it) {
+      AIEX::RuntimeSequenceOp seq_op = *it;
+      err.attachNote(seq_op.getLoc()) << "Sequence operation definition here.";
+    }
+    return failure();
+  }
   return success();
 }

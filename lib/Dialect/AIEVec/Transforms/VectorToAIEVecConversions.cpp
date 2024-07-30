@@ -12,6 +12,7 @@
 // to ops that can be translated to a sequence of valid AIEVec ops.
 //===----------------------------------------------------------------------===//
 
+#include "aie/Dialect/AIEVec/AIE1/IR/AIEVecAIE1Ops.h"
 #include "aie/Dialect/AIEVec/AIEVecUtils.h"
 #include "aie/Dialect/AIEVec/IR/AIEVecOps.h"
 #include "aie/Dialect/AIEVec/Pipelines/Passes.h"
@@ -29,7 +30,6 @@
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/TypeSwitch.h"
-
 #include "llvm/Support/raw_ostream.h"
 #include <bitset>
 #include <optional>
@@ -111,16 +111,16 @@ extractMACOperandsFromAddOperands(Value addLhs, Value addRhs) {
   if (mulOp)
     return std::make_tuple(mulOp.getLhs(), mulOp.getRhs(), acc);
 
-  // If the MulIOp has been already translated to aievec::MulOp:
+  // If the MulIOp has been already translated to aievec::aie1::MulOp:
   auto lhsSrsOp = addLhs.getDefiningOp<aievec::SRSOp>();
   auto rhsSrsOp = addRhs.getDefiningOp<aievec::SRSOp>();
-  aievec::MulOp aieMulOp = nullptr;
+  aievec::aie1::MulOp aieMulOp = nullptr;
   if (lhsSrsOp) {
-    aieMulOp = lhsSrsOp.getSource().getDefiningOp<aievec::MulOp>();
+    aieMulOp = lhsSrsOp.getSource().getDefiningOp<aievec::aie1::MulOp>();
     acc = addRhs;
   }
   if (!aieMulOp && rhsSrsOp) {
-    aieMulOp = rhsSrsOp.getSource().getDefiningOp<aievec::MulOp>();
+    aieMulOp = rhsSrsOp.getSource().getDefiningOp<aievec::aie1::MulOp>();
     acc = addLhs;
   }
   if (aieMulOp)
@@ -275,9 +275,9 @@ buildAttributeListForRotationSelectOp(PatternRewriter &rewriter, VectorType vTy,
 
 namespace xilinx::aievec {
 
-SmallVector<NamedAttribute> buildFMAOpSplatAttrForElemTy(aievec::FMAOp fmaOp,
-                                                         int64_t bcastPos,
-                                                         int64_t step = 1) {
+SmallVector<NamedAttribute>
+buildFMAOpSplatAttrForElemTy(aievec::aie1::FMAOp fmaOp, int64_t bcastPos,
+                             int64_t step = 1) {
   unsigned width = 0;
   auto elemTy = fmaOp.getLhs().getType().getElementType();
   if (auto intTy = dyn_cast<IntegerType>(elemTy))
@@ -628,6 +628,70 @@ struct ConvertMulAddToAIEVecFMAElemOpPattern
   unsigned shiftParam;
 };
 
+// Convert `vector.fma` to `aievec.mac_elem`. Only `vector<16xf32>` and
+// `vector<16xbf16>` operand types are supported. In the case of vectors with
+// `f32` elemental type, this pattern will try to match `bf16` to `f32`
+// widening ops in the `lhs` and `rhs` operands, or fail otherwise.
+// TODO: When sign extensions are not found, a conversion from `f32` to `bf16`
+// TODO: can be inserted to emulate `f32` fma with `bf16` logic.
+struct ConvertVectorFMAOpToAIEVecFMAElemOpPattern
+    : OpConversionPattern<vector::FMAOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  ConvertVectorFMAOpToAIEVecFMAElemOpPattern(MLIRContext *context,
+                                             unsigned shiftParam = 0)
+      : OpConversionPattern(context), shiftParam(shiftParam) {}
+
+  LogicalResult
+  matchAndRewrite(vector::FMAOp fmaOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // Verify the vector type is supported by AIE2
+    auto resVecTy = cast<VectorType>(fmaOp.getType());
+    auto resElemTy = resVecTy.getElementType();
+    unsigned numElems = getVectorLaneSize(resVecTy);
+
+    if (numElems != 16 || (!resElemTy.isF32() && !resElemTy.isBF16()))
+      return rewriter.notifyMatchFailure(
+          fmaOp, "Unsupported operand types in vector.fma lowering.");
+
+    Value lhs = adaptor.getLhs();
+    Value rhs = adaptor.getRhs();
+    Value acc = adaptor.getAcc();
+    if (resElemTy.isBF16())
+      acc = rewriter.create<aievec::UPSOp>(
+          fmaOp.getLoc(), VectorType::get({16}, rewriter.getF32Type()), acc,
+          shiftParam);
+    else {
+      lhs = getSourceOfWideningOp(lhs).value_or(nullptr);
+      rhs = getSourceOfWideningOp(rhs).value_or(nullptr);
+      if (!lhs || !rhs)
+        return rewriter.notifyMatchFailure(
+            fmaOp, "vector.fma operands are f32, and they don't come from "
+                   "arith.extf on bf16; can't lower to aievec.");
+      if (!cast<VectorType>(lhs.getType()).getElementType().isBF16() ||
+          !cast<VectorType>(rhs.getType()).getElementType().isBF16())
+        return rewriter.notifyMatchFailure(
+            fmaOp, "vector.fma operands come from arith.extf, but the source "
+                   "of the widening op is not bf16; can't lower to aievec.");
+    }
+    Value newOp = rewriter.create<aievec::FMAElemOp>(
+        fmaOp.getLoc(), acc.getType(), lhs, rhs, acc, /*fmsub=*/false);
+
+    if (resElemTy.isBF16()) {
+      auto shiftParamOp = rewriter.create<arith::ConstantOp>(
+          fmaOp.getLoc(), rewriter.getI32IntegerAttr(shiftParam));
+      newOp = rewriter.create<aievec::SRSOp>(fmaOp.getLoc(), resVecTy, newOp,
+                                             shiftParamOp);
+    }
+
+    rewriter.replaceOp(fmaOp, newOp);
+
+    return success();
+  }
+
+  unsigned shiftParam;
+};
+
 // This pattern replaces `arith.mulf` on vectors with
 // `aievec.mul_elem`. This pattern works for AIE2.
 struct ConvertMulFToAIEVecMulElemOpPattern
@@ -838,13 +902,13 @@ struct ConvertMulIToAIEVecMulElemOpPattern
   unsigned shiftParam;
 };
 
-// This pattern folds an extract + broadcast feeding into an `aievec::FMAOp`
-// into the op, using the shuffle attributes.
-struct FoldBroadcastToFMAOp : OpConversionPattern<aievec::FMAOp> {
+// This pattern folds an extract + broadcast feeding into an
+// `aievec::aie1::FMAOp` into the op, using the shuffle attributes.
+struct FoldBroadcastToFMAOp : OpConversionPattern<aievec::aie1::FMAOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(aievec::FMAOp fmaOp, OpAdaptor adaptor,
+  matchAndRewrite(aievec::aie1::FMAOp fmaOp, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto concatOp =
         dyn_cast<aievec::ConcatOp>(adaptor.getLhs().getDefiningOp());
@@ -879,7 +943,7 @@ struct FoldBroadcastToFMAOp : OpConversionPattern<aievec::FMAOp> {
     auto pos = extOp.getStaticPosition();
     int64_t zstart = pos[0];
     auto fmaOpAttr = buildFMAOpSplatAttrForElemTy(fmaOp, zstart);
-    rewriter.replaceOpWithNewOp<aievec::FMAOp>(
+    rewriter.replaceOpWithNewOp<aievec::aie1::FMAOp>(
         fmaOp, TypeRange({fmaOp.getResult().getType()}),
         ValueRange({lhsX2, rhs, adaptor.getAcc()}), fmaOpAttr);
 
@@ -887,11 +951,12 @@ struct FoldBroadcastToFMAOp : OpConversionPattern<aievec::FMAOp> {
   }
 };
 
-struct ConvertMulAddToAIEVecFMAOpPattern : OpConversionPattern<aievec::AddOp> {
+struct ConvertMulAddToAIEVecFMAOpPattern
+    : OpConversionPattern<aievec::aie1::AddOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(aievec::AddOp addOp, OpAdaptor adaptor,
+  matchAndRewrite(aievec::aie1::AddOp addOp, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto vecType = cast<VectorType>(addOp.getType());
 
@@ -913,7 +978,7 @@ struct ConvertMulAddToAIEVecFMAOpPattern : OpConversionPattern<aievec::AddOp> {
                                                SmallVector<Value, 2>(2, lhs))
                      .getResult();
     auto upsOp = rewriter.create<aievec::UPSOp>(addOp.getLoc(), accType, acc);
-    auto fmaOp = rewriter.create<aievec::FMAOp>(
+    auto fmaOp = rewriter.create<aievec::aie1::FMAOp>(
         addOp.getLoc(), accType, lhsX2, rhs, upsOp.getResult(),
         /*xstart=*/"", /*xoffsets=*/"", /*xoffsets_hi=*/"", /*xstep=*/"",
         /*xsquare=*/"", /*zstart=*/"", /*zoffsets=*/"", /*zoffsets_hi=*/"",
@@ -1031,7 +1096,7 @@ struct LowerVectorAddIOpToAIEVecAddOp : OpConversionPattern<arith::AddIOp> {
         (rhsDefOp && isa<arith::MulIOp>(rhsDefOp)))
       return failure();
 
-    rewriter.replaceOpWithNewOp<aievec::AddOp>(
+    rewriter.replaceOpWithNewOp<aievec::aie1::AddOp>(
         addOp, resType, lhs, rhs,
         /*xstart=*/"", /*xoffsets=*/"", /*xoffsets_hi=*/"", /*xsquare=*/"",
         /*zstart=*/"", /*zoffsets=*/"", /*zoffsets_hi=*/"", /*zsquare=*/"");
@@ -1040,13 +1105,13 @@ struct LowerVectorAddIOpToAIEVecAddOp : OpConversionPattern<arith::AddIOp> {
 };
 
 using LowerVectorAddFOpToAIEVecAddOp =
-    OneToOneVectorOpToAIEVecOpPattern<arith::AddFOp, aievec::AddOp>;
+    OneToOneVectorOpToAIEVecOpPattern<arith::AddFOp, aievec::aie1::AddOp>;
 using LowerVectorMulFOpToAIEVecMulOp =
-    OneToOneVectorOpToAIEVecOpPattern<arith::MulFOp, aievec::MulOp>;
+    OneToOneVectorOpToAIEVecOpPattern<arith::MulFOp, aievec::aie1::MulOp>;
 using LowerVectorSubIOpToAIEVecSubOp =
-    OneToOneVectorOpToAIEVecOpPattern<arith::SubIOp, aievec::SubOp>;
+    OneToOneVectorOpToAIEVecOpPattern<arith::SubIOp, aievec::aie1::SubOp>;
 using LowerVectorSubFOpToAIEVecSubOp =
-    OneToOneVectorOpToAIEVecOpPattern<arith::SubFOp, aievec::SubOp>;
+    OneToOneVectorOpToAIEVecOpPattern<arith::SubFOp, aievec::aie1::SubOp>;
 
 struct LowerVectorMulIOpToAIEVecMulOp : OpConversionPattern<arith::MulIOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -1057,7 +1122,7 @@ struct LowerVectorMulIOpToAIEVecMulOp : OpConversionPattern<arith::MulIOp> {
     if (!resTy)
       return failure();
     auto accTy = getVectorOpDestType(resTy, /*AIE2 =*/false);
-    auto newMulOp = rewriter.create<aievec::MulOp>(
+    auto newMulOp = rewriter.create<aievec::aie1::MulOp>(
         mulOp.getLoc(), accTy, adaptor.getLhs(), adaptor.getRhs());
     auto shiftParamOp = rewriter.create<arith::ConstantOp>(
         mulOp.getLoc(), rewriter.getI32IntegerAttr(0));
@@ -2994,6 +3059,7 @@ static void populateAIEVecV2ConversionPatterns(RewritePatternSet &patterns,
       FoldVectorExtractAndBroadcastToAIEBroadcast,
       ConvertBroadcastToAIEBroadcast,
       ConvertMulAddToAIEVecFMAElemOpPattern,
+      ConvertVectorFMAOpToAIEVecFMAElemOpPattern,
       LowerVectorExtractStridedSliceOpAIE2Pattern,
       LowerVectorTransposeOpToAIEVecShuffleOpPattern
       >(patterns.getContext());
@@ -3065,7 +3131,8 @@ static bool isInSigmoidOperationChain(math::ExpOp expOp) {
 
 static void configureAIEVecCommonLegalizations(ConversionTarget &target,
                                                TargetBackend backend) {
-  target.addLegalDialect<xilinx::aievec::AIEVecDialect, arith::ArithDialect,
+  target.addLegalDialect<xilinx::aievec::aie1::AIEVecAIE1Dialect,
+                         xilinx::aievec::AIEVecDialect, arith::ArithDialect,
                          emitc::EmitCDialect>();
   if (backend == TargetBackend::CPP) {
     target.addIllegalOp<vector::TransferReadOp>();
@@ -3423,36 +3490,39 @@ static void configureAIEVecV1Legalizations(ConversionTarget &target,
       [](arith::MulIOp op) { return !isa<VectorType>(op.getType()); });
   target.addDynamicallyLegalOp<arith::MulFOp>(
       [](arith::MulFOp op) { return !isa<VectorType>(op.getType()); });
-  target.addDynamicallyLegalOp<aievec::FMAOp>([](xilinx::aievec::FMAOp op) {
-    auto lhsDefOp = op.getLhs().getDefiningOp();
-    aievec::ConcatOp concatOp = nullptr;
-    if (lhsDefOp)
-      concatOp = dyn_cast<aievec::ConcatOp>(op.getLhs().getDefiningOp());
-    if (!concatOp)
-      return true;
+  target.addDynamicallyLegalOp<aievec::aie1::FMAOp>(
+      [](xilinx::aievec::aie1::FMAOp op) {
+        auto lhsDefOp = op.getLhs().getDefiningOp();
+        aievec::ConcatOp concatOp = nullptr;
+        if (lhsDefOp)
+          concatOp = dyn_cast<aievec::ConcatOp>(op.getLhs().getDefiningOp());
+        if (!concatOp)
+          return true;
 
-    vector::BroadcastOp srcBcast = nullptr;
-    if (auto lhsOp = concatOp.getSources()[0].getDefiningOp())
-      srcBcast = dyn_cast<vector::BroadcastOp>(lhsOp);
-    if (!srcBcast) {
-      auto rhsOp = op.getRhs().getDefiningOp();
-      if (!rhsOp)
+        vector::BroadcastOp srcBcast = nullptr;
+        if (auto lhsOp = concatOp.getSources()[0].getDefiningOp())
+          srcBcast = dyn_cast<vector::BroadcastOp>(lhsOp);
+        if (!srcBcast) {
+          auto rhsOp = op.getRhs().getDefiningOp();
+          if (!rhsOp)
+            return true;
+          srcBcast = dyn_cast<vector::BroadcastOp>(rhsOp);
+        }
+
+        if (srcBcast)
+          if (auto srcOp = srcBcast.getSource().getDefiningOp())
+            return !isa<vector::ExtractOp>(srcOp);
+
         return true;
-      srcBcast = dyn_cast<vector::BroadcastOp>(rhsOp);
-    }
+      });
 
-    if (srcBcast)
-      if (auto srcOp = srcBcast.getSource().getDefiningOp())
-        return !isa<vector::ExtractOp>(srcOp);
-
-    return true;
-  });
-
-  target.addDynamicallyLegalOp<aievec::AddOp>([](aievec::AddOp op) {
+  target.addDynamicallyLegalOp<aievec::aie1::AddOp>([](aievec::aie1::AddOp op) {
     auto lSrsOp = op.getLhs().getDefiningOp<aievec::SRSOp>();
     auto rSrsOp = op.getRhs().getDefiningOp<aievec::SRSOp>();
-    return (!lSrsOp || !lSrsOp.getSource().getDefiningOp<aievec::MulOp>()) &&
-           (!rSrsOp || !rSrsOp.getSource().getDefiningOp<aievec::MulOp>());
+    return (!lSrsOp ||
+            !lSrsOp.getSource().getDefiningOp<aievec::aie1::MulOp>()) &&
+           (!rSrsOp ||
+            !rSrsOp.getSource().getDefiningOp<aievec::aie1::MulOp>());
   });
   target.addLegalDialect<memref::MemRefDialect>();
 }
@@ -3675,7 +3745,8 @@ static void configureAIEVecV2Legalizations(ConversionTarget &target,
         return false;
       });
 
-  target.addIllegalOp<vector::ContractionOp, vector::TransposeOp>();
+  target.addIllegalOp<vector::ContractionOp, vector::TransposeOp,
+                      vector::FMAOp>();
 }
 
 //===----------------------------------------------------------------------===//
@@ -3703,9 +3774,11 @@ struct LowerVectorToAIEVec : PassWrapper<LowerVectorToAIEVec, OperationPass<>> {
     return "Lower vector operations to AIE vector intrinsics";
   }
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<affine::AffineDialect, xilinx::aievec::AIEVecDialect,
-                    arith::ArithDialect, memref::MemRefDialect, scf::SCFDialect,
-                    vector::VectorDialect, emitc::EmitCDialect>();
+    registry
+        .insert<affine::AffineDialect, xilinx::aievec::aie1::AIEVecAIE1Dialect,
+                xilinx::aievec::AIEVecDialect, arith::ArithDialect,
+                memref::MemRefDialect, scf::SCFDialect, vector::VectorDialect,
+                emitc::EmitCDialect>();
   }
 
   Option<std::string> aieTarget{
