@@ -13,6 +13,7 @@ extern "C" {
 
 #include "aie/Dialect/AIE/IR/AIEDialect.h"
 #include "aie/Dialect/AIE/IR/AIEEnums.h"
+#include "aie/Dialect/AIEX/IR/AIEXDialect.h"
 
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -38,6 +39,7 @@ extern "C" {
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
 
 #ifndef NDEBUG
 #define XAIE_DEBUG
@@ -51,6 +53,7 @@ extern "C" {
 #include "xaiengine/xaie_locks.h"
 #include "xaiengine/xaie_plif.h"
 #include "xaiengine/xaie_ss.h"
+#include "xaiengine/xaie_txn.h"
 #include "xaiengine/xaiegbl.h"
 #include "xaiengine/xaiegbl_defs.h"
 }
@@ -107,15 +110,17 @@ static const std::map<WireBundle, StrmSwPortType>
         {WireBundle::Trace, StrmSwPortType::TRACE},
 };
 
+#ifndef NDEBUG
+
 // https://stackoverflow.com/a/32230306
 template <typename H1>
-raw_ostream &showArgs(raw_ostream &out, const char *label, H1 &&value) {
+static raw_ostream &showArgs(raw_ostream &out, const char *label, H1 &&value) {
   return out << label << "=" << std::forward<H1>(value);
 }
 
 template <typename H1, typename... T>
-raw_ostream &showArgs(raw_ostream &out, const char *label, H1 &&value,
-                      T &&...rest) {
+static raw_ostream &showArgs(raw_ostream &out, const char *label, H1 &&value,
+                             T &&...rest) {
   const char *pcomma = strchr(label, ',');
   return showArgs(out.write(label, pcomma - label)
                       << "=" << std::forward<H1>(value) << ',',
@@ -124,19 +129,19 @@ raw_ostream &showArgs(raw_ostream &out, const char *label, H1 &&value,
 
 #define SHOW_ARGS(os, ...) showArgs(os, #__VA_ARGS__, __VA_ARGS__)
 
-raw_ostream &operator<<(raw_ostream &os, const XAie_LocType &loc) {
+static raw_ostream &operator<<(raw_ostream &os, const XAie_LocType &loc) {
   os << "XAie_LocType(col: " << std::to_string(loc.Col)
      << ", row: " << std::to_string(loc.Row) << ")";
   return os;
 }
 
-raw_ostream &operator<<(raw_ostream &os, const XAie_Lock &lock) {
+static raw_ostream &operator<<(raw_ostream &os, const XAie_Lock &lock) {
   os << "XAie_Lock(id: " << std::to_string(lock.LockId)
      << ", val: " << std::to_string(lock.LockVal) << ")";
   return os;
 }
 
-raw_ostream &operator<<(raw_ostream &os, const XAie_Packet &packet) {
+static raw_ostream &operator<<(raw_ostream &os, const XAie_Packet &packet) {
   os << "XAie_Packet(id: " << std::to_string(packet.PktId)
      << ", type: " << std::to_string(packet.PktType) << ")";
   return os;
@@ -176,6 +181,31 @@ static_assert(XAIE_OK == 0);
     }                                                                          \
   } while (0)
 
+#else
+
+#define TRY_XAIE_API_FATAL_ERROR(API, ...)                                     \
+  do {                                                                         \
+    if (auto r = API(__VA_ARGS__))                                             \
+      llvm::report_fatal_error(llvm::Twine(#API " failed with ") +             \
+                               AIERCTOSTR.at(r));                              \
+  } while (0)
+
+#define TRY_XAIE_API_EMIT_ERROR(OP, API, ...)                                  \
+  do {                                                                         \
+    if (auto r = API(__VA_ARGS__))                                             \
+      return OP.emitOpError() << #API " failed with " << AIERCTOSTR.at(r);     \
+  } while (0)
+
+#define TRY_XAIE_API_LOGICAL_RESULT(API, ...)                                  \
+  do {                                                                         \
+    if (auto r = API(__VA_ARGS__)) {                                           \
+      llvm::errs() << #API " failed with " << AIERCTOSTR.at(r);                \
+      return failure();                                                        \
+    }                                                                          \
+  } while (0)
+
+#endif
+
 auto ps = std::filesystem::path::preferred_separator;
 
 #define XAIE_BASE_ADDR 0x40000000
@@ -190,14 +220,14 @@ auto ps = std::filesystem::path::preferred_separator;
 #define MEM_TILE_LOCK_ID_INCR 64
 #define BASE_ADDR_A_INCR 0x80000
 
-namespace xilinx::AIE {
-
-LogicalResult configureLocksInBdBlock(XAie_DmaDesc &dmaTileBd, Block &block,
-                                      const AIETargetModel &targetModel,
-                                      XAie_LocType &tileLoc) {
+static LogicalResult configureLocksInBdBlock(XAie_DmaDesc &dmaTileBd,
+                                             Block &block,
+                                             const AIETargetModel &targetModel,
+                                             XAie_LocType &tileLoc) {
   LLVM_DEBUG(llvm::dbgs() << "\nstart configuring bds\n");
   std::optional<int> acqValue, relValue, acqLockId, relLockId;
-  bool acqEn;
+  bool acqEn = false;
+
   // switch (lock->getAc)
   for (auto op : block.getOps<UseLockOp>()) {
     // Only dyn_cast if you are going to check if it was of the type
@@ -241,13 +271,15 @@ LogicalResult configureLocksInBdBlock(XAie_DmaDesc &dmaTileBd, Block &block,
   return success();
 }
 
-LogicalResult configureBdInBlock(XAie_DevInst &devInst, XAie_DmaDesc &dmaTileBd,
-                                 Block &block,
-                                 const AIETargetModel &targetModel,
-                                 XAie_LocType &tileLoc, int bdId,
-                                 std::optional<int> nextBdId) {
+static LogicalResult configureBdInBlock(XAie_DevInst &devInst,
+                                        XAie_DmaDesc &dmaTileBd, Block &block,
+                                        const AIETargetModel &targetModel,
+                                        XAie_LocType &tileLoc, int bdId,
+                                        std::optional<int> nextBdId) {
   std::optional<int> packetType;
   std::optional<int> packetID;
+
+  // Below should go
   auto maybePacketOps = block.getOps<DMABDPACKETOp>();
   if (!maybePacketOps.empty()) {
     assert(llvm::range_size(maybePacketOps) == 1 &&
@@ -327,6 +359,7 @@ LogicalResult configureBdInBlock(XAie_DevInst &devInst, XAie_DmaDesc &dmaTileBd,
   // ND zero padding.
   std::optional<llvm::ArrayRef<BDPadLayoutAttr>> padDims =
       bdOp.getPadDimensions();
+
   if (padDims) {
     XAie_DmaPadTensor dmaPadTensor = {};
     dmaPadTensor.NumDim = padDims->size();
@@ -362,6 +395,11 @@ LogicalResult configureBdInBlock(XAie_DevInst &devInst, XAie_DmaDesc &dmaTileBd,
                             nextBdId.value(), enableNextBd);
   }
 
+  if (auto packetInfo = bdOp.getPacket()) {
+    packetType = packetInfo->getPktType();
+    packetID = packetInfo->getPktId();
+  }
+
   if (packetID) {
     if (!packetType)
       bdOp.emitError("must have packetType with packetID");
@@ -380,10 +418,11 @@ LogicalResult configureBdInBlock(XAie_DevInst &devInst, XAie_DmaDesc &dmaTileBd,
   return success();
 };
 
-LogicalResult pushToBdQueueAndEnable(XAie_DevInst &devInst, Operation &op,
-                                     XAie_LocType &tileLoc, int chNum,
-                                     const DMAChannelDir &channelDir, int bdId,
-                                     int repeatCount) {
+static LogicalResult pushToBdQueueAndEnable(XAie_DevInst &devInst,
+                                            Operation &op,
+                                            XAie_LocType &tileLoc, int chNum,
+                                            const DMAChannelDir &channelDir,
+                                            int bdId, int repeatCount) {
   XAie_DmaDirection direction =
       channelDir == DMAChannelDir::S2MM ? DMA_S2MM : DMA_MM2S;
   auto enTokenIssue = tileLoc.Row == 0 && direction == DMA_S2MM;
@@ -397,9 +436,9 @@ LogicalResult pushToBdQueueAndEnable(XAie_DevInst &devInst, Operation &op,
   return success();
 };
 
-LogicalResult configureLocksAndBd(XAie_DevInst &devInst, Block &block,
-                                  XAie_LocType tileLoc,
-                                  const AIETargetModel &targetModel) {
+static LogicalResult configureLocksAndBd(XAie_DevInst &devInst, Block &block,
+                                         XAie_LocType tileLoc,
+                                         const AIETargetModel &targetModel) {
   DMABDOp bd = *block.getOps<DMABDOp>().begin();
   assert(bd.getBdId().has_value() &&
          "DMABDOp must have assigned bd_id; did you forget to run "
@@ -416,6 +455,7 @@ LogicalResult configureLocksAndBd(XAie_DevInst &devInst, Block &block,
   return success();
 };
 
+namespace {
 struct AIEControl {
   XAie_Config configPtr;
   XAie_DevInst devInst;
@@ -442,6 +482,8 @@ struct AIEControl {
     case AIEArch::AIE2p:
       devGen = XAIE_DEV_GEN_AIE2P_STRIX_B0;
       break;
+    default:
+      assert(false);
     }
     configPtr = XAie_Config{
         /*AieGen*/ devGen,
@@ -482,17 +524,28 @@ struct AIEControl {
     TRY_XAIE_API_FATAL_ERROR(XAie_UpdateNpiAddr, &devInst, NPI_ADDR);
   }
 
-  LogicalResult addAieElfToCDO(uint8_t col, uint8_t row,
-                               const StringRef elfPath, bool aieSim) {
+  LogicalResult addAieElf(uint8_t col, uint8_t row, const StringRef elfPath,
+                          bool aieSim) {
+    TRY_XAIE_API_LOGICAL_RESULT(XAie_CoreDisable, &devInst,
+                                XAie_TileLoc(col, row));
+    TRY_XAIE_API_LOGICAL_RESULT(XAie_DmaChannelResetAll, &devInst,
+                                XAie_TileLoc(col, row),
+                                XAie_DmaChReset::DMA_CHANNEL_RESET);
+
     // loadSym: Load symbols from .map file. This argument is not used when
     // __AIESIM__ is not defined.
     TRY_XAIE_API_LOGICAL_RESULT(XAie_LoadElf, &devInst, XAie_TileLoc(col, row),
                                 elfPath.str().c_str(), /*loadSym*/ aieSim);
+
+    TRY_XAIE_API_LOGICAL_RESULT(XAie_DmaChannelResetAll, &devInst,
+                                XAie_TileLoc(col, row),
+                                XAie_DmaChReset::DMA_CHANNEL_UNRESET);
+
     return success();
   }
 
-  LogicalResult addAieElfsToCDO(DeviceOp &targetOp, const StringRef workDirPath,
-                                bool aieSim) {
+  LogicalResult addAieElfs(DeviceOp &targetOp, const StringRef workDirPath,
+                           bool aieSim) {
     for (auto tileOp : targetOp.getOps<TileOp>())
       if (tileOp.isShimNOCorPLTile()) {
         // Resets no needed with V2 kernel driver
@@ -507,7 +560,7 @@ struct AIEControl {
             fileName = (llvm::Twine("core_") + std::to_string(col) + "_" +
                         std::to_string(row) + ".elf")
                            .str();
-          if (failed(addAieElfToCDO(
+          if (failed(addAieElf(
                   col, row,
                   (llvm::Twine(workDirPath) + std::string(1, ps) + fileName)
                       .str(),
@@ -518,7 +571,7 @@ struct AIEControl {
     return success();
   }
 
-  LogicalResult addInitConfigToCDO(DeviceOp &targetOp) {
+  LogicalResult addInitConfig(DeviceOp &targetOp) {
     for (auto tileOp : targetOp.getOps<TileOp>()) {
       auto tileLoc = XAie_TileLoc(tileOp.colIndex(), tileOp.rowIndex());
       if (!tileOp.isShimTile() && tileOp.getCoreOp()) {
@@ -605,14 +658,6 @@ struct AIEControl {
       int32_t row = switchboxOp.rowIndex();
       XAie_LocType tileLoc = XAie_TileLoc(col, row);
       assert(targetModel.isNPU() && "Only NPU currently supported");
-      if (row == 0) {
-        // FIXME hack for TCT routing
-        // TODO Support both channels
-        auto slvPortNum = 0;
-        auto mstrPortNum = 0;
-        TRY_XAIE_API_EMIT_ERROR(switchboxOp, XAie_StrmConnCctEnable, &devInst,
-                                tileLoc, CTRL, slvPortNum, SOUTH, mstrPortNum);
-      }
 
       Block &b = switchboxOp.getConnections().front();
       for (auto connectOp : b.getOps<ConnectOp>())
@@ -623,50 +668,60 @@ struct AIEControl {
             WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(connectOp.getDestBundle()),
             connectOp.destIndex());
 
-      for (auto connectOp : b.getOps<MasterSetOp>()) {
+      for (auto masterSetOp : b.getOps<MasterSetOp>()) {
         int mask = 0;
         int arbiter = -1;
 
-        for (auto val : connectOp.getAmsels()) {
+        for (auto val : masterSetOp.getAmsels()) {
           AMSelOp amsel = cast<AMSelOp>(val.getDefiningOp());
           arbiter = amsel.arbiterIndex();
           int msel = amsel.getMselValue();
           mask |= (1 << msel);
         }
 
-        bool isdma = connectOp.getDestBundle() == WireBundle::DMA;
+        // the default is to keep header
+        bool keepHeader = true;
+        // the default for dma destinations is to drop the header
+        if (masterSetOp.getDestBundle() == WireBundle::DMA)
+          keepHeader = false;
         // assume a connection going south from row zero gets wired to shimdma
-        // by a shimmux. TODO: fix the assumption
-        if (!isdma && (switchboxOp.rowIndex() == 0))
-          isdma = connectOp.getDestBundle() == WireBundle::South;
-        // Flag for overriding DROP_HEADER. TODO: Formalize this in tablegen
-        isdma &= !connectOp->hasAttr("keep_pkt_header");
-        auto dropHeader =
-            isdma ? XAIE_SS_PKT_DROP_HEADER : XAIE_SS_PKT_DONOT_DROP_HEADER;
+        // by a shimmux.
+        if (switchboxOp.rowIndex() == 0 &&
+            masterSetOp.getDestBundle() == WireBundle::South)
+          keepHeader = false;
+
+        // "keep_pkt_header" attribute overrides the above defaults, if set
+        if (auto keep = masterSetOp.getKeepPktHeader())
+          keepHeader = *keep;
+
+        auto dropHeader = keepHeader ? XAIE_SS_PKT_DONOT_DROP_HEADER
+                                     : XAIE_SS_PKT_DROP_HEADER;
         TRY_XAIE_API_EMIT_ERROR(
-            connectOp, XAie_StrmPktSwMstrPortEnable, &devInst, tileLoc,
-            WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(connectOp.getDestBundle()),
-            connectOp.destIndex(), dropHeader, arbiter, mask);
+            masterSetOp, XAie_StrmPktSwMstrPortEnable, &devInst, tileLoc,
+            WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(masterSetOp.getDestBundle()),
+            masterSetOp.destIndex(), dropHeader, arbiter, mask);
       }
 
-      for (auto connectOp : b.getOps<PacketRulesOp>()) {
+      for (auto packetRulesOp : b.getOps<PacketRulesOp>()) {
         int slot = 0;
-        Block &block = connectOp.getRules().front();
+        Block &block = packetRulesOp.getRules().front();
         for (auto slotOp : block.getOps<PacketRuleOp>()) {
           AMSelOp amselOp = cast<AMSelOp>(slotOp.getAmsel().getDefiningOp());
           int arbiter = amselOp.arbiterIndex();
           int msel = amselOp.getMselValue();
-          TRY_XAIE_API_EMIT_ERROR(
-              connectOp, XAie_StrmPktSwSlavePortEnable, &devInst, tileLoc,
-              WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(connectOp.getSourceBundle()),
-              connectOp.sourceIndex());
+          TRY_XAIE_API_EMIT_ERROR(packetRulesOp, XAie_StrmPktSwSlavePortEnable,
+                                  &devInst, tileLoc,
+                                  WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(
+                                      packetRulesOp.getSourceBundle()),
+                                  packetRulesOp.sourceIndex());
           auto packetInit = XAie_PacketInit(slotOp.valueInt(), /*PktType*/ 0);
           // TODO Need to better define packet id,type used here
-          TRY_XAIE_API_EMIT_ERROR(
-              connectOp, XAie_StrmPktSwSlaveSlotEnable, &devInst, tileLoc,
-              WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(connectOp.getSourceBundle()),
-              connectOp.sourceIndex(), slot, packetInit, slotOp.maskInt(), msel,
-              arbiter);
+          TRY_XAIE_API_EMIT_ERROR(packetRulesOp, XAie_StrmPktSwSlaveSlotEnable,
+                                  &devInst, tileLoc,
+                                  WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(
+                                      packetRulesOp.getSourceBundle()),
+                                  packetRulesOp.sourceIndex(), slot, packetInit,
+                                  slotOp.maskInt(), msel, arbiter);
           slot++;
         }
       }
@@ -720,7 +775,7 @@ struct AIEControl {
     return success();
   }
 
-  LogicalResult addCoreEnableToCDO(DeviceOp &targetOp) {
+  LogicalResult addCoreEnable(DeviceOp &targetOp) {
     // Start execution of all the cores.
     for (auto tileOp : targetOp.getOps<TileOp>()) {
       auto tileLoc = XAie_TileLoc(tileOp.colIndex(), tileOp.rowIndex());
@@ -729,26 +784,20 @@ struct AIEControl {
     }
     return success();
   }
-
-  void dmaUpdateBdAddr(DeviceOp &targetOp, int col, int row, size_t addr,
-                       size_t bdId) {
-    auto tileLoc = XAie_TileLoc(col, row);
-    TRY_XAIE_API_FATAL_ERROR(XAie_DmaUpdateBdAddr, &devInst, tileLoc, addr,
-                             bdId);
-  }
 };
 
-} // namespace xilinx::AIE
+} // namespace
 
-void initializeCDOGenerator(byte_ordering endianness, bool cdoDebug) {
+static void initializeCDOGenerator(byte_ordering endianness, bool cdoDebug) {
   // Enables AXI-MM prints for configs being added in CDO
   if (cdoDebug)
     EnAXIdebug();
   setEndianness(endianness);
 };
 
-LogicalResult generateCDOBinary(const StringRef outputPath,
-                                const std::function<LogicalResult()> &cb) {
+static LogicalResult
+generateCDOBinary(const StringRef outputPath,
+                  const std::function<LogicalResult()> &cb) {
 
   // TODO(newling): Get bootgen team to remove print statement in this function.
   startCDOFileStream(outputPath.str().c_str());
@@ -763,17 +812,18 @@ LogicalResult generateCDOBinary(const StringRef outputPath,
   return success();
 }
 
-LogicalResult generateCDOBinariesSeparately(AIEControl &ctl,
-                                            const StringRef workDirPath,
-                                            DeviceOp &targetOp, bool aieSim,
-                                            bool enableCores) {
+static LogicalResult generateCDOBinariesSeparately(AIEControl &ctl,
+                                                   const StringRef workDirPath,
+                                                   DeviceOp &targetOp,
+                                                   bool aieSim,
+                                                   bool enableCores) {
 
   LLVM_DEBUG(llvm::dbgs() << "Generating aie_cdo_elfs.bin");
   if (failed(generateCDOBinary(
           (llvm::Twine(workDirPath) + std::string(1, ps) + "aie_cdo_elfs.bin")
               .str(),
           [&ctl, &targetOp, &workDirPath, &aieSim] {
-            return ctl.addAieElfsToCDO(targetOp, workDirPath, aieSim);
+            return ctl.addAieElfs(targetOp, workDirPath, aieSim);
           })))
     return failure();
 
@@ -781,7 +831,7 @@ LogicalResult generateCDOBinariesSeparately(AIEControl &ctl,
   if (failed(generateCDOBinary(
           (llvm::Twine(workDirPath) + std::string(1, ps) + "aie_cdo_init.bin")
               .str(),
-          [&ctl, &targetOp] { return ctl.addInitConfigToCDO(targetOp); })))
+          [&ctl, &targetOp] { return ctl.addInitConfig(targetOp); })))
     return failure();
 
   LLVM_DEBUG(llvm::dbgs() << "Generating aie_cdo_enable.bin");
@@ -789,35 +839,35 @@ LogicalResult generateCDOBinariesSeparately(AIEControl &ctl,
       failed(generateCDOBinary(
           (llvm::Twine(workDirPath) + std::string(1, ps) + "aie_cdo_enable.bin")
               .str(),
-          [&ctl, &targetOp] { return ctl.addCoreEnableToCDO(targetOp); })))
+          [&ctl, &targetOp] { return ctl.addCoreEnable(targetOp); })))
     return failure();
 
   return success();
 }
 
-LogicalResult generateCDOUnified(AIEControl &ctl, const StringRef workDirPath,
-                                 DeviceOp &targetOp, bool aieSim,
-                                 bool enableCores) {
+static LogicalResult generateCDOUnified(AIEControl &ctl,
+                                        const StringRef workDirPath,
+                                        DeviceOp &targetOp, bool aieSim,
+                                        bool enableCores) {
   return generateCDOBinary(
       (llvm::Twine(workDirPath) + std::string(1, ps) + "aie_cdo.bin").str(),
       [&ctl, &targetOp, &workDirPath, &aieSim, &enableCores] {
         if (!targetOp.getOps<CoreOp>().empty() &&
-            failed(ctl.addAieElfsToCDO(targetOp, workDirPath, aieSim)))
+            failed(ctl.addAieElfs(targetOp, workDirPath, aieSim)))
           return failure();
-        if (failed(ctl.addInitConfigToCDO(targetOp)))
+        if (failed(ctl.addInitConfig(targetOp)))
           return failure();
         if (enableCores && !targetOp.getOps<CoreOp>().empty() &&
-            failed(ctl.addCoreEnableToCDO(targetOp)))
+            failed(ctl.addCoreEnable(targetOp)))
           return failure();
         return success();
       });
 }
 
-LogicalResult AIETranslateToCDODirect(ModuleOp m, llvm::StringRef workDirPath,
-                                      byte_ordering endianness,
-                                      bool emitUnified, bool cdoDebug,
-                                      bool aieSim, bool xaieDebug,
-                                      bool enableCores) {
+static LogicalResult
+translateToCDODirect(ModuleOp m, llvm::StringRef workDirPath,
+                     byte_ordering endianness, bool emitUnified, bool cdoDebug,
+                     bool aieSim, bool xaieDebug, bool enableCores) {
 
   auto devOps = m.getOps<DeviceOp>();
   assert(llvm::range_size(devOps) == 1 &&
@@ -843,16 +893,460 @@ LogicalResult AIETranslateToCDODirect(ModuleOp m, llvm::StringRef workDirPath,
   }();
   return result;
 }
-// Not sure why but defining this with xilinx::AIE will create a duplicate
-// symbol in libAIETargets.a that then doesn't actually match the header?
-namespace xilinx::AIE {
-LogicalResult AIETranslateToCDODirect(ModuleOp m, llvm::StringRef workDirPath,
-                                      bool bigEndian, bool emitUnified,
-                                      bool cdoDebug, bool aieSim,
-                                      bool xaieDebug, bool enableCores) {
+
+namespace {
+
+// An TransactionBinaryOperation encapulates an aie-rt TnxCmd struct
+struct TransactionBinaryOperation {
+  struct XAie_TxnCmd cmd;
+  TransactionBinaryOperation(XAie_TxnOpcode opc, uint32_t mask, uint64_t addr,
+                             uint32_t value, const uint8_t *data,
+                             uint32_t size) {
+    cmd.Opcode = opc;
+    cmd.Mask = mask;
+    cmd.RegOff = addr;
+    cmd.Value = value;
+    cmd.DataPtr = reinterpret_cast<uint64_t>(data);
+    cmd.Size = size;
+  }
+};
+} // namespace
+
+// Parse a TXN binary blob. On success return the number of columns from the
+// header and a vector of parsed operations. On failure return std::nullopt.
+static std::optional<int>
+parseTransactionBinary(const std::vector<uint8_t> &data,
+                       std::vector<TransactionBinaryOperation> &ops) {
+
+  uint32_t major = data[0];
+  uint32_t minor = data[1];
+  uint32_t num_cols = data[4];
+
+  uint32_t num_ops, txn_size;
+  std::memcpy(&num_ops, &data[8], 4);
+  std::memcpy(&txn_size, &data[12], 4);
+
+  LLVM_DEBUG(llvm::dbgs() << "Major: " << major << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "Minor: " << minor << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "DevGen: " << data[2] << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "NumRows: " << data[3] << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "NumCols: " << num_cols << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "NumMemTileRows: " << data[5] << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "NumOps: " << num_ops << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "TxnSize: " << txn_size << " bytes\n");
+
+  size_t i = 16;
+
+  // Convert opcode from uint8 to enum
+  auto convertOpcode = [](uint8_t opc) {
+    switch (opc) {
+    case 0:
+      return XAie_TxnOpcode::XAIE_IO_WRITE;
+    case 1:
+      return XAie_TxnOpcode::XAIE_IO_BLOCKWRITE;
+    case 3:
+      return XAie_TxnOpcode::XAIE_IO_MASKWRITE;
+    default:
+      llvm::errs() << "Unhandled opcode: " << std::to_string(opc) << "\n";
+      return XAie_TxnOpcode::XAIE_IO_CUSTOM_OP_MAX;
+    }
+  };
+
+  // Parse the binary blob. There are two versions supported, 0.1 and 1.0.
+  // For both versions, build a list of TransactionBinaryOperation objects
+  // representing the parsed operations.
+  if (major == 0 && minor == 1) {
+    while (i < data.size()) {
+
+      XAie_TxnOpcode opc = convertOpcode(data[i]);
+      LLVM_DEBUG(llvm::dbgs() << "opcode: " + std::to_string(opc) + "\n");
+
+      uint64_t addr = 0;
+      uint32_t value = 0;
+      uint32_t size = 0;
+      uint32_t mask = 0;
+      const uint8_t *data_ptr = nullptr;
+
+      if (opc == XAie_TxnOpcode::XAIE_IO_WRITE) {
+        LLVM_DEBUG(llvm::dbgs() << "opcode: WRITE (0x00)\n");
+        uint32_t addr0, addr1;
+        std::memcpy(&addr0, &data[i + 8], 4);
+        std::memcpy(&addr1, &data[i + 12], 4);
+        std::memcpy(&value, &data[i + 16], 4);
+        std::memcpy(&size, &data[i + 20], 4);
+        addr = static_cast<uint64_t>(addr1) << 32 | addr0;
+        i += size;
+      } else if (opc == XAie_TxnOpcode::XAIE_IO_BLOCKWRITE) {
+        LLVM_DEBUG(llvm::dbgs() << "opcode: BLOCKWRITE (0x01)\n");
+        std::memcpy(&addr, &data[i + 8], 4);
+        std::memcpy(&size, &data[i + 12], 4);
+        data_ptr = data.data() + i + 16;
+        i += size;
+        size = size - 16;
+      } else if (opc == XAie_TxnOpcode::XAIE_IO_MASKWRITE) {
+        LLVM_DEBUG(llvm::dbgs() << "opcode: MASKWRITE (0x03)\n");
+        uint32_t addr0, addr1;
+        std::memcpy(&addr0, &data[i + 8], 4);
+        std::memcpy(&addr1, &data[i + 12], 4);
+        std::memcpy(&value, &data[i + 16], 4);
+        std::memcpy(&mask, &data[i + 20], 4);
+        std::memcpy(&size, &data[i + 24], 4);
+        addr = static_cast<uint64_t>(addr1) << 32 | addr0;
+        i += size;
+      } else {
+        llvm::errs() << "Unhandled opcode: " << std::to_string(opc) << "\n";
+        return std::nullopt;
+      }
+      ops.emplace_back(opc, mask, addr, value, data_ptr, size);
+      LLVM_DEBUG(llvm::dbgs() << "addr: " << addr << "\n");
+      LLVM_DEBUG(llvm::dbgs() << "value: " << value << "\n");
+      LLVM_DEBUG(llvm::dbgs() << "size: " << size << "\n");
+      LLVM_DEBUG(llvm::dbgs() << "mask: " << mask << "\n");
+      LLVM_DEBUG(llvm::dbgs()
+                 << "data: " << reinterpret_cast<uintptr_t>(data_ptr) << "\n");
+    }
+  } else if (major == 1 && minor == 0) {
+    while (i < data.size()) {
+
+      XAie_TxnOpcode opc = convertOpcode(data[i]);
+      LLVM_DEBUG(llvm::dbgs() << "opcode: " + std::to_string(opc) + "\n");
+
+      uint64_t addr = 0;
+      uint32_t value = 0;
+      uint32_t size = 0;
+      uint32_t mask = 0;
+      const uint8_t *data_ptr = nullptr;
+
+      if (opc == XAie_TxnOpcode::XAIE_IO_WRITE) {
+        LLVM_DEBUG(llvm::dbgs() << "opcode: WRITE (0x00)\n");
+        std::memcpy(&addr, &data[i + 4], 4);
+        std::memcpy(&value, &data[i + 8], 4);
+        i += 12;
+      } else if (opc == XAie_TxnOpcode::XAIE_IO_BLOCKWRITE) {
+        LLVM_DEBUG(llvm::dbgs() << "opcode: BLOCKWRITE (0x01)\n");
+        std::memcpy(&addr, &data[i + 4], 4);
+        std::memcpy(&size, &data[i + 8], 4);
+        data_ptr = data.data() + i + 12;
+        i += size;
+        size = size - 12;
+      } else if (opc == XAie_TxnOpcode::XAIE_IO_MASKWRITE) {
+        LLVM_DEBUG(llvm::dbgs() << "opcode: MASKWRITE (0x03)\n");
+        std::memcpy(&addr, &data[i + 4], 4);
+        std::memcpy(&value, &data[i + 8], 4);
+        std::memcpy(&mask, &data[i + 12], 4);
+        i += 16;
+      } else {
+        llvm::errs() << "Unhandled opcode: " << std::to_string(opc) << "\n";
+        return std::nullopt;
+      }
+      LLVM_DEBUG(llvm::dbgs() << "addr: " << addr << "\n");
+      LLVM_DEBUG(llvm::dbgs() << "value: " << value << "\n");
+      LLVM_DEBUG(llvm::dbgs() << "size: " << size << "\n");
+      LLVM_DEBUG(llvm::dbgs() << "mask: " << mask << "\n");
+      LLVM_DEBUG(llvm::dbgs()
+                 << "data: " << reinterpret_cast<uintptr_t>(data_ptr) << "\n");
+      ops.emplace_back(opc, mask, addr, value, data_ptr, size);
+    }
+  } else {
+    llvm::errs() << "Unsupported TXN binary version: " << major << "." << minor
+                 << "\n";
+    return std::nullopt;
+  }
+
+  return num_cols;
+}
+
+static LogicalResult generateTxn(AIEControl &ctl, const StringRef workDirPath,
+                                 DeviceOp &targetOp, bool aieSim,
+                                 bool enableElfs, bool enableInit,
+                                 bool enableCores) {
+  if (enableElfs && !targetOp.getOps<CoreOp>().empty() &&
+      failed(ctl.addAieElfs(targetOp, workDirPath, aieSim)))
+    return failure();
+  if (enableInit && failed(ctl.addInitConfig(targetOp)))
+    return failure();
+  if (enableCores && !targetOp.getOps<CoreOp>().empty() &&
+      failed(ctl.addCoreEnable(targetOp)))
+    return failure();
+  return success();
+}
+
+static LogicalResult translateToTxn(ModuleOp m, std::vector<uint8_t> &output,
+                                    llvm::StringRef workDirPath, bool aieSim,
+                                    bool xaieDebug, bool enableCores) {
+
+  auto devOps = m.getOps<DeviceOp>();
+  if (llvm::range_size(devOps) > 1)
+    return m.emitError("only exactly 1 device op supported.");
+
+  DeviceOp targetOp = *devOps.begin();
+  const BaseNPUTargetModel &targetModel =
+      (const BaseNPUTargetModel &)targetOp.getTargetModel();
+
+  if (!targetModel.isNPU())
+    return failure();
+
+  AIEControl ctl(aieSim, xaieDebug, targetModel);
+
+  // start collecting transations
+  XAie_StartTransaction(&ctl.devInst, XAIE_TRANSACTION_DISABLE_AUTO_FLUSH);
+
+  auto result =
+      generateTxn(ctl, workDirPath, targetOp, aieSim, true, true, true);
+  if (failed(result))
+    return result;
+
+  // Export the transactions to a buffer
+  uint8_t *txn_ptr = XAie_ExportSerializedTransaction(&ctl.devInst, 0, 0);
+  XAie_TxnHeader *hdr = (XAie_TxnHeader *)txn_ptr;
+  std::vector<uint8_t> txn_data(txn_ptr, txn_ptr + hdr->TxnSize);
+  output.swap(txn_data);
+
+  return success();
+}
+
+LogicalResult xilinx::AIE::AIETranslateToCDODirect(
+    ModuleOp m, llvm::StringRef workDirPath, bool bigEndian, bool emitUnified,
+    bool cdoDebug, bool aieSim, bool xaieDebug, bool enableCores) {
   byte_ordering endianness =
       bigEndian ? byte_ordering::Big_Endian : byte_ordering::Little_Endian;
-  return AIETranslateToCDODirect(m, workDirPath, endianness, emitUnified,
-                                 cdoDebug, aieSim, xaieDebug, enableCores);
+  return translateToCDODirect(m, workDirPath, endianness, emitUnified, cdoDebug,
+                              aieSim, xaieDebug, enableCores);
 }
-} // namespace xilinx::AIE
+
+std::optional<mlir::ModuleOp>
+xilinx::AIE::AIETranslateBinaryToTxn(mlir::MLIRContext *ctx,
+                                     std::vector<uint8_t> &binary) {
+
+  // parse the binary
+  std::vector<TransactionBinaryOperation> operations;
+  auto c = parseTransactionBinary(binary, operations);
+  if (!c) {
+    llvm::errs() << "Failed to parse binary\n";
+    return std::nullopt;
+  }
+  int columns = *c;
+
+  auto loc = mlir::UnknownLoc::get(ctx);
+
+  // create a new ModuleOp and set the insertion point
+  auto module = ModuleOp::create(loc);
+  OpBuilder builder(module.getBodyRegion());
+  builder.setInsertionPointToStart(module.getBody());
+
+  // create aie.device
+  std::vector<AIEDevice> devices{AIEDevice::npu1_1col, AIEDevice::npu1_2col,
+                                 AIEDevice::npu1_3col, AIEDevice::npu1_4col,
+                                 AIEDevice::npu1};
+  auto device = builder.create<DeviceOp>(loc, devices[columns - 1]);
+  device.getRegion().emplaceBlock();
+  builder.setInsertionPointToStart(device.getBody());
+
+  // for each blockwrite in the binary, create a GlobalOp with the data
+  std::vector<memref::GlobalOp> global_data;
+  for (auto &op : operations) {
+    if (op.cmd.Opcode != XAIE_IO_BLOCKWRITE) {
+      global_data.push_back(nullptr);
+      continue;
+    }
+    uint32_t size = op.cmd.Size / 4;
+    const uint32_t *d = reinterpret_cast<const uint32_t *>(op.cmd.DataPtr);
+    std::vector<uint32_t> data32(d, d + size);
+
+    int id = 0;
+    std::string name = "blockwrite_data";
+    while (device.lookupSymbol(name))
+      name = "blockwrite_data_" + std::to_string(id++);
+
+    MemRefType memrefType = MemRefType::get({size}, builder.getI32Type());
+    TensorType tensorType = RankedTensorType::get({size}, builder.getI32Type());
+    auto global = builder.create<memref::GlobalOp>(
+        loc, name, builder.getStringAttr("private"), memrefType,
+        DenseElementsAttr::get<uint32_t>(tensorType, data32), true, nullptr);
+    global_data.push_back(global);
+  }
+
+  // create aiex.runtime_sequence
+  auto seq = builder.create<AIEX::RuntimeSequenceOp>(loc, nullptr);
+  seq.getBody().push_back(new Block);
+
+  // create the txn ops
+  builder.setInsertionPointToStart(&seq.getBody().front());
+  for (auto p : llvm::zip(operations, global_data)) {
+    auto op = std::get<0>(p);
+    memref::GlobalOp payload = std::get<1>(p);
+
+    if (op.cmd.Opcode == XAie_TxnOpcode::XAIE_IO_WRITE) {
+      builder.create<AIEX::NpuWrite32Op>(loc, op.cmd.RegOff, op.cmd.Value,
+                                         nullptr, nullptr, nullptr);
+    } else if (op.cmd.Opcode == XAie_TxnOpcode::XAIE_IO_BLOCKWRITE) {
+      auto memref = builder.create<memref::GetGlobalOp>(loc, payload.getType(),
+                                                        payload.getName());
+      builder.create<AIEX::NpuBlockWriteOp>(
+          loc, builder.getUI32IntegerAttr(op.cmd.RegOff), memref.getResult(),
+          nullptr, nullptr, nullptr);
+    } else if (op.cmd.Opcode == XAie_TxnOpcode::XAIE_IO_MASKWRITE) {
+      builder.create<AIEX::NpuMaskWrite32Op>(loc, op.cmd.RegOff, op.cmd.Value,
+                                             op.cmd.Mask, nullptr, nullptr,
+                                             nullptr);
+    } else {
+      llvm::errs() << "Unhandled txn opcode: " << op.cmd.Opcode << "\n";
+      return std::nullopt;
+    }
+  }
+
+  return module;
+}
+
+std::optional<mlir::ModuleOp>
+xilinx::AIE::AIETranslateBinaryToCtrlpkt(mlir::MLIRContext *ctx,
+                                         std::vector<uint8_t> &binary) {
+
+  // parse the binary
+  std::vector<TransactionBinaryOperation> operations;
+  auto c = parseTransactionBinary(binary, operations);
+  if (!c) {
+    llvm::errs() << "Failed to parse binary\n";
+    return std::nullopt;
+  }
+  int columns = *c;
+
+  auto loc = mlir::UnknownLoc::get(ctx);
+
+  // create a new ModuleOp and set the insertion point
+  auto module = ModuleOp::create(loc);
+  OpBuilder builder(module.getBodyRegion());
+  builder.setInsertionPointToStart(module.getBody());
+
+  // create aie.device
+  std::vector<AIEDevice> devices{AIEDevice::npu1_1col, AIEDevice::npu1_2col,
+                                 AIEDevice::npu1_3col, AIEDevice::npu1_4col,
+                                 AIEDevice::npu1};
+  auto device = builder.create<DeviceOp>(loc, devices[columns - 1]);
+  device.getRegion().emplaceBlock();
+  builder.setInsertionPointToStart(device.getBody());
+
+  // for each blockwrite in the binary, create a GlobalOp with the data
+  std::vector<memref::GlobalOp> global_data;
+  for (auto &op : operations) {
+    if (op.cmd.Opcode != XAIE_IO_BLOCKWRITE) {
+      global_data.push_back(nullptr);
+      continue;
+    }
+    uint32_t size = op.cmd.Size / 4;
+    const uint32_t *d = reinterpret_cast<const uint32_t *>(op.cmd.DataPtr);
+    std::vector<uint32_t> data32(d, d + size);
+
+    int id = 0;
+    std::string name = "blockwrite_data";
+    while (device.lookupSymbol(name))
+      name = "blockwrite_data_" + std::to_string(id++);
+
+    MemRefType memrefType = MemRefType::get({size}, builder.getI32Type());
+    TensorType tensorType = RankedTensorType::get({size}, builder.getI32Type());
+    auto global = builder.create<memref::GlobalOp>(
+        loc, name, builder.getStringAttr("private"), memrefType,
+        DenseElementsAttr::get<uint32_t>(tensorType, data32), true, nullptr);
+    global_data.push_back(global);
+  }
+
+  // create aiex.runtime_sequence
+  auto seq = builder.create<AIEX::RuntimeSequenceOp>(loc, nullptr);
+  seq.getBody().push_back(new Block);
+
+  // create the txn ops
+  builder.setInsertionPointToStart(&seq.getBody().front());
+  for (auto p : llvm::zip(operations, global_data)) {
+    auto op = std::get<0>(p);
+    memref::GlobalOp payload = std::get<1>(p);
+
+    if (op.cmd.Opcode == XAie_TxnOpcode::XAIE_IO_WRITE) {
+      builder.create<AIEX::NpuControlPacketOp>(
+          loc, builder.getUI32IntegerAttr(op.cmd.RegOff), nullptr,
+          /*opcode*/ builder.getI32IntegerAttr(0),
+          /*stream_id*/ builder.getI32IntegerAttr(0),
+          DenseI32ArrayAttr::get(ctx, ArrayRef<int32_t>(op.cmd.Value)));
+    } else if (op.cmd.Opcode == XAie_TxnOpcode::XAIE_IO_BLOCKWRITE) {
+      if (!std::get<1>(p).getInitialValue())
+        continue;
+      auto blockWriteData =
+          dyn_cast<DenseIntElementsAttr>(*std::get<1>(p).getInitialValue());
+      if (!blockWriteData) {
+        payload.emitError(
+            "Global symbol initial value is not a dense int array");
+        break;
+      }
+      auto blockWriteDataValues = blockWriteData.getValues<int32_t>();
+      // Split block write data into beats of 4 or less, in int32_t.
+      int currAddr = op.cmd.RegOff;
+      for (size_t i = 0; i < blockWriteDataValues.size(); i += 4) {
+        auto last = std::min(blockWriteDataValues.size(), i + 4);
+        SmallVector<int32_t> splitData =
+            SmallVector<int32_t>(blockWriteDataValues.begin() + i,
+                                 blockWriteDataValues.begin() + last);
+        builder.create<AIEX::NpuControlPacketOp>(
+            loc, builder.getUI32IntegerAttr(currAddr), nullptr,
+            /*opcode*/ builder.getI32IntegerAttr(0),
+            /*stream_id*/ builder.getI32IntegerAttr(0),
+            DenseI32ArrayAttr::get(ctx, ArrayRef<int32_t>(splitData)));
+        currAddr += splitData.size() * sizeof(int32_t);
+      }
+
+    } else if (op.cmd.Opcode == XAie_TxnOpcode::XAIE_IO_MASKWRITE) {
+      builder.create<AIEX::NpuControlPacketOp>(
+          loc, builder.getUI32IntegerAttr(op.cmd.RegOff), nullptr,
+          /*opcode*/ builder.getI32IntegerAttr(0),
+          /*stream_id*/ builder.getI32IntegerAttr(0),
+          DenseI32ArrayAttr::get(ctx, ArrayRef<int32_t>(op.cmd.Value)));
+    } else {
+      llvm::errs() << "Unhandled txn opcode: " << op.cmd.Opcode << "\n";
+      return std::nullopt;
+    }
+  }
+
+  return module;
+}
+
+LogicalResult xilinx::AIE::AIETranslateToTxn(ModuleOp m,
+                                             llvm::raw_ostream &output,
+                                             llvm::StringRef workDirPath,
+                                             bool outputBinary, bool enableSim,
+                                             bool xaieDebug, bool enableCores) {
+  std::vector<uint8_t> bin;
+  auto result =
+      translateToTxn(m, bin, workDirPath, enableSim, xaieDebug, enableCores);
+  if (failed(result))
+    return result;
+
+  if (outputBinary) {
+    output.write(reinterpret_cast<const char *>(bin.data()), bin.size());
+    return success();
+  }
+
+  auto new_module = AIETranslateBinaryToTxn(m.getContext(), bin);
+  if (!new_module)
+    return failure();
+  new_module->print(output);
+  return success();
+}
+
+LogicalResult xilinx::AIE::AIETranslateToControlPackets(
+    ModuleOp m, llvm::raw_ostream &output, llvm::StringRef workDirPath,
+    bool outputBinary, bool enableSim, bool xaieDebug, bool enableCores) {
+  std::vector<uint8_t> bin;
+  auto result =
+      translateToTxn(m, bin, workDirPath, enableSim, xaieDebug, enableCores);
+  if (failed(result))
+    return result;
+
+  if (outputBinary) {
+    output.write(reinterpret_cast<const char *>(bin.data()), bin.size());
+    return success();
+  }
+
+  auto new_module = AIETranslateBinaryToCtrlpkt(m.getContext(), bin);
+  if (!new_module)
+    return failure();
+  new_module->print(output);
+  return success();
+}
